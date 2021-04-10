@@ -1,0 +1,394 @@
+---
+author: "Carlos Michel Mourra Díaz"
+date: "09/03/21"
+output: 
+  html_document:
+    df_print: paged
+    code_folding: show
+    self_contained: yes
+    theme: yeti
+    highlight: haddock
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+# Carlos Michel Mourra Díaz
+
+# Introducción
+
+Análisis de grupos o agrupamiento es la tarea de agrupar objetos por similitud, en grupos o conjuntos de manera que los miembros del mismo grupo tengan características similares.
+
+Para realizar este analisis de agrupamiento sobre el grupo de proteínas ABC, para clasificar correctamente estas proteinas sera necesario generar una matriz de distancias debido a su score de disimilitud el cual se calcula por medio de la siguiente formula utilizando el bitscore:
+
+$$
+B_{i,j} = \frac{b_{i,j}}{max(b_{x,y} : x,y = 1..n)}: i \neq j , x \neq y
+$$
+Una vez que se tenga la matriz de distancia se aplicaran los algoritmos de clustering que permitan clasificar las proteinas de acuerdo a su homología.
+
+# Alineamiento
+
+Primero sera necesario realizar el alineamiento entre las proteinas del archivo por medio de BLASTP, en este caso ingresaremos al servidor tepeu para obtener los bitscores de los alineamientos.
+
+```{bash eval = FALSE}
+
+#Iniciamso sesion en tepeu para correr BLAST 
+ssh -Y cmourra@tepeu.lcg.unam.mx 
+
+# Nos dirigimos a la carpeta donde correremos el BLAST
+cd /export/storage/users/cmourra/Clustering
+
+# Corremos el BLAST con los parametros indicados
+blastp -query ABC.faa -subject ABC.faa -outfmt 7 -max_hsps 1 -use_sw_tback -evalue 100 -out ABC3.faa.ali
+```
+
+# Generar archivo csv con python
+
+Una vez que se haya realizado el alineamiento es necesario extraer la información necesaria por medio de python para generar un archivo csv que contenga el alineamiento junto con el bitscore, el escore de similitud y el score de disimilitud.
+
+```{r, message=FALSE, warning=FALSE, eval = FALSE}
+install.packages("reticulate")
+```
+
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE}
+  library("reticulate")
+```
+
+```{python, eval=FALSE }
+ 
+import csv
+
+# Abrimos los documentos necesarios
+file = open("../Downloads/ABC3.faa.ali","r")
+new_file = open("../Documents/alignment_scores.csv","w")
+new_file2 = open("../Documents/alignment_scores2.csv","w")
+writer = csv.writer(new_file)
+writer2 = csv.writer(new_file2)
+
+# Listas que contendran la información que necesitamos
+alignments = []
+bitscores = []
+values = []
+
+# Recorrer el archivo del BLAST para obtener la información
+for line in file:
+    
+    # Obtenemos el alineamiento y el bitscore
+    if line.startswith("#"):
+        continue
+    line = line.replace("\n","")
+    line = line.split("\t")
+    seq1 = line[0]
+    seq2 = line[1]
+    bitscore = float(line[11])
+    align = "{}_{}".format(seq1,seq2)
+    val = (align,bitscore)
+
+        
+    # Rellenamos las listas con la informacion obtenida
+    alignments.append(align)
+    bitscores.append(bitscore)
+    values.append(val)
+  
+    
+# Generar diccionario que asocie el bitscore al alineamiento
+align_scores = dict.fromkeys(alignments)
+max_bit = max(bitscores)
+
+# Generar los csv que seran interpretados por R
+csv_rowlist = ["Alingment","Bitscore","Similarity","Dissimilarity"]
+writer.writerow(csv_rowlist)
+csv_rowlist2 = ["Sequence_1","Sequence_2","Bitscore","Similarity","Dissimilarity"]
+writer2.writerow(csv_rowlist2)
+
+# ahora se buscara generar el archivo para el score de disimilitud
+Alignment = []
+Bitscore = []
+Similarity = []
+Dissimilarity = []
+
+
+# recorrer el diccionario para obtener el escore de disimilitud a partir del bitscore
+for key in align_scores:
+    for align in values:
+        if key == align[0]:
+            bits = align[1]
+            similarity = bits / max_bit
+            dissimilarity = 1 - similarity
+            
+            Alignment.append(key)
+            Bitscore.append(bits)
+            Similarity.append(similarity)
+            Dissimilarity.append(dissimilarity)
+            
+            
+            scores = (bits,similarity,dissimilarity)
+            align_scores[key] = scores
+            
+
+
+# Escribir los archivos csv
+for i in range(len(Alignment)):
+    writer.writerow([Alignment[i],Bitscore[i],Similarity[i],Dissimilarity[i]])
+    seqs = Alignment[i].split("_")
+    Seq_1 = seqs[0]
+    Seq_2 = seqs[1]
+    writer2.writerow([Seq_1,Seq_2,Bitscore[i],Similarity[i],Dissimilarity[i]])
+
+    
+# cerrar los archivos 
+file.close()
+new_file.close()
+new_file2.close()
+ 
+```
+
+Caragremos las librerias necesarias para generar los modulos que se agruparan por medio de algoritmos de clustering.
+
+```{r setup, include=FALSE}
+library(cluster)
+suppressPackageStartupMessages(library(factoextra))
+suppressPackageStartupMessages(library(dendextend))
+suppressPackageStartupMessages(library(ape))
+```
+
+# Extracción de datos
+
+Una vez que generamos el archivo csv que contenga los scores de los alineamientos, por medio de R capturaremos estos datos en un dataframe que contenga el alineamiento y el score de disimilitud.
+
+```{r}
+# Abrimos el archivo csv que generamos del alineamiento
+InputData  <- read.table("/Users/carlosmichelmourradiaz/Documents/alignment_scores2.csv", header = TRUE, sep = ",", quote="")
+```
+
+
+```{r}
+# Generamos un dataframe unicamente con los datos que nos interesan
+datos <- data.frame(Sequence_1 = InputData$Sequence_1, Sequence_2 = InputData$Sequence_2, Dissimilarity = InputData$Dissimilarity)
+
+```
+
+Para poder realizar los analisis de clustering, es necesario que los scores de disimilitud se encuentren anotados por medio de una matriz de 2 dimensiones cuyo tamaño es de 100x100. En este caso encontramos que debido al bajo e-value se han perdido 8 alineamientos. Por lo que en este caso la matriz anotara estos valores como 0.
+
+```{r}
+# Funcion que genera la matriz de scores
+Generate_Matrix <- function(datos,rows,cols,value2){
+  num_rows <- length(rows)
+  num_cols <- length(cols)
+  total <- num_cols*num_rows
+  mat <- matrix(1:total,nrow = num_rows, ncol = num_cols)
+  rownames(mat) <- rows
+  colnames(mat) <- cols
+  
+  # Recorrer los valores y rellenar la matriz 
+  for (row in rows){
+    for (col in cols){
+      index <- datos$Sequence_1 == row & datos$Sequence_2 == col
+      if (length(datos$Dissimilarity[index]) > 0){
+        mat[row,col] <- datos$Dissimilarity[index]
+      }
+      # Si no se encontro el alineamiento rellenar con un 0
+      else{
+        mat[row,col] <- value2
+      }
+    }
+    
+  }
+  return(mat)
+}
+
+# Obtenemos los genes para las filas y columnas de la matriz
+row_genes <- unique(datos$Sequence_1)
+col_genes <- unique(datos$Sequence_2)
+
+# Generamos la matriz
+valores <- Generate_Matrix(datos,row_genes,col_genes,NA)
+
+```
+
+# hCLUST
+
+Generamos los dendogramas con cada uno de los metodos de clustering que existen.
+
+```{r}
+ccom <- hclust(dist(valores), method = "complete")
+csin <- hclust(dist(valores), method = "single")
+cave <- hclust(dist(valores), method = "average")
+cward <- hclust(dist(valores), method = "ward.D2")
+```
+
+Obtenemos los coeficientes de aglomeración y los guardamos en una variable.
+
+```{r}
+# sacar los coeficientes de aglomeración de cada modelo de clustering
+coeffcom <- coef(ccom)
+coeffsin <- coef(csin)
+coeffave <- coef(cave)
+coeffward <- coef(cward)
+```
+
+Imprimimos los coeficientes de aglomeración para interpretar que tanto agrupamiento hay entre los distintos modelos.
+
+```{r}
+# obtenemos los coeficientes de aglomeración
+print("Complete")
+coeffcom
+print("Single")
+coeffsin
+print("Average")
+coeffave
+print("Ward")
+coeffward 
+```
+
+```{r}
+# Dendograma con complete
+plot (ccom, hang = -1, main = "hclust Dendogram Complete")
+cls3 <- cutree(ccom, k=3)
+
+```
+
+```{r}
+# plot de dendograma con single 
+plot (csin, hang = -1, main = "hclust Dendogram Single")
+cls4 <- cutree(cave, k=3)
+
+```
+
+```{r}
+# plot de dendograma con average
+plot (cave, hang = -1, main = "hclust Dendogram Average")
+cls5 <- cutree(cave, k=3)
+
+```
+
+```{r}
+# Plot de dendograma con ward 
+plot (cward, hang = -1, main = "hclust Dendogram Ward")
+cls6 <- cutree(cward, k=3)
+
+```
+
+```{r}
+# Guardar los dendogramas en formato tree
+my_treecom <- as.phylo(ccom)
+write.tree(phy=my_treecom, file="/Users/carlosmichelmourradiaz/Documents/complete_tree.tree")
+
+my_treesin <- as.phylo(csin)
+write.tree(phy=my_treesin, file="/Users/carlosmichelmourradiaz/Documents/single_tree.tree")
+
+my_treecave <- as.phylo(cave)
+write.tree(phy=my_treecave, file="/Users/carlosmichelmourradiaz/Documents/average_tree.tree")
+
+my_treeward <- as.phylo(cward)
+write.tree(phy=my_treeward, file="/Users/carlosmichelmourradiaz/Documents/ward_tree.tree")
+
+
+```
+
+## Average
+
+![Average](../Desktop/Average.png)
+
+## Complete
+
+![complete](../Desktop/Complete.png)
+
+## Single
+
+![Single](../Desktop/Single.png)
+
+## Ward
+
+![Ward](../Desktop/Ward.png)
+
+Mayor Coeficiente de Aglomeración: Ward -> 0.93
+
+Menor Coeficiente de Aglomeración: Single -> 0.57
+
+En este caso es posible observar que el metodo de clasificación ward clasifico de manera mas especifica los grupos de proteinas de modo que seria bueno en el caso de querer identificar por modulos las proteinas de mayor similitud. Sin embargo si se desea identificar familias los metodos que podrian resultar adecuados serian complete y average los cuales identifican similitud entre las proteinas pero no son tan estrictos. Cabe destacar que en este caso el metodo que mas problemas presento en la clasificación es Single, lo cual puede notarse a simple vista en donde se saco una proteina de todos los grupos.
+
+# Agnes
+
+Ahora realizaremos el agrupamiento utilizando la funcion de agnes, de este modo sera posible observar si los modulos generados son similares.
+
+```{r}
+# Generamos la matriz
+valores2 <- Generate_Matrix(datos,row_genes,col_genes,0)
+```
+
+Para poder utilizar agnes es necesario que la matriz de distancias no posea valores faltantes, por este motivo se realizara una matriz en donde se coloque un 0 en cada uno de los valores faltantes.
+
+```{r}
+# Generamos los modelos de clustering con los diferentes metodos
+aClustcom <- agnes(valores2, method = "complete")
+aClustsin <- agnes(valores2, method = "single")
+aClustave <- agnes(valores2, method = "average")
+aClustward <- agnes(valores2, method = "ward")
+
+```
+
+
+```{r}
+# Observamos el dendograma generado con Agnes para el metodo complete
+pltree(aClustcom, cex = 0.6, hang = -1, main = "agnes Dendrogram Complete")
+aCoeffcom <- aClustcom$ac
+rect.hclust(as.hclust(aClustcom), k = 6, border=2:4)
+aCls3 <- cutree(as.hclust(aClustcom), k = 6)
+fviz_cluster(list(data = valores2, cluster = aCls3))
+
+```
+
+
+```{r}
+# Observamos el dendograma generado con Agnes para el metodo single
+pltree(aClustsin, cex = 0.6, hang = -1, main = "agnes Dendrogram Single")
+aCoeffsin <- aClustsin$ac
+rect.hclust(as.hclust(aClustsin), k=6, border=2:4)
+aCls4 <- cutree(as.hclust(aClustsin), k = 6)
+fviz_cluster(list(data = valores2, cluster = aCls4))
+```
+
+
+```{r}
+# Observamos el dendograma generado con Agnes para el metodo average
+pltree(aClustave, cex = 0.6, hang = -1, main = "agnes Dendrogram Average")
+aCoeffave <- aClustave$ac
+rect.hclust(as.hclust(aClustave), k=6, border=2:4)
+aCls5 <- cutree(as.hclust(aClustave), k = 6)
+fviz_cluster(list(data = valores2, cluster = aCls5))
+
+```
+
+
+```{r}
+
+# Observamos el dendograma generado con Agnes para el metodo ward
+pltree(aClustward, cex = 0.6, hang = -1, main = "agnes Dendrogram Ward")
+aCoeffward <- aClustward$ac
+rect.hclust(as.hclust(aClustward), k=6, border=2:4)
+aCls6 <- cutree(as.hclust(aClustward), k = 6)
+fviz_cluster(list(data = valores2, cluster = aCls6))
+
+```
+
+```{r}
+
+# Observamos los coeficientes de aglomeración
+print("Complete")
+aCoeffcom
+print("Single")
+aCoeffsin
+print("Average")
+aCoeffave
+print("Ward")
+aCoeffward
+```
+
+Mayor Coeficiente de Aglomeración: Ward -> 0.92
+
+Menor Coeficiente de Aglomeración: Single -> 0.54
+
+De igual modo que con hClust es posible observar que el metodo que es menos capaz de dtectar con mejor precisión los grupos de proteinas es Single mientras que ward se mantiene como uno de los metodos que puede clasificar de mejor forma cada proteina similar. Por otro lado complete y average tambien demuestran ser buenos metodos.
+
